@@ -10,6 +10,9 @@ dependencies = [
     "rich>=13,<15",
 ]
 
+[project.scripts]
+harness = "harness_app.cli:run"
+
 [build-system]
 requires = ["hatchling>=1.26,<2"]
 build-backend = "hatchling.build"
