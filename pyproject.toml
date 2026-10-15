@@ -1,0 +1,18 @@
+[project]
+name = "python-harness-lesson"
+version = "0.1.0"
+description = "Learn to build a harness with ChatGPT OAuth and the Responses API"
+requires-python = ">=3.9"
+dependencies = [
+    "httpx>=0.27,<1",
+    "prompt-toolkit>=3.0,<4",
+    "PyJWT[crypto]>=2.10,<3",
+    "rich>=13,<15",
+]
+
+[build-system]
+requires = ["hatchling>=1.26,<2"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harness_app"]
