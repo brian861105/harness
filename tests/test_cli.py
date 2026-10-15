@@ -4,17 +4,16 @@ import runpy
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import httpx
 
 from harness_app import cli
 from harness_app.auth.login import save_registration
 from harness_app.auth.session import save_credentials
-from tests.fakes import tool_call
 
 
-class CLIToolTests(unittest.TestCase):
+class CLITests(unittest.TestCase):
     def test_script_entrypoint_exposes_unavailable_model_as_its_public_error(self):
         with tempfile.TemporaryDirectory() as directory:
             def login(client, state_directory):
@@ -39,28 +38,20 @@ class CLIToolTests(unittest.TestCase):
             self.assertEqual(caught.exception.code, 1)
             self.assertIn('model-a', diagnostic.getvalue())
 
-    def test_single_shot_rejects_shell_calls_when_stdin_is_not_a_terminal(self):
-        requests = []
+    def test_positional_prompt_is_rejected_before_state_creation_or_login(self):
+        self.check_early_rejection(['Question'], terminal=True)
+
+    def test_nonterminal_stdin_is_rejected_before_state_creation_or_login(self):
+        self.check_early_rejection([], terminal=False)
+
+    def check_early_rejection(self, arguments, terminal):
         with tempfile.TemporaryDirectory() as directory:
-            marker = Path(directory) / 'marker'
-            call = tool_call('run_shell', {'command': 'touch ' + str(marker)})
-            responses = iter([{'status': 'completed', 'output': [call]},
-                              {'status': 'completed', 'output': []}])
-            def provider(request):
-                if request.method == 'GET':
-                    return httpx.Response(200, json={'models': [{'slug': 'model', 'visibility': 'list'}]})
-                requests.append(json.loads(request.content))
-                event = {'type': 'response.completed', 'response': next(responses)}
-                return httpx.Response(200, text='data: ' + json.dumps(event) + '\n\n')
-            client = httpx.Client(transport=httpx.MockTransport(provider))
-            self.addCleanup(client.close)
-            with patch('harness_app.cli.AuthSession', return_value=Mock(access_token=Mock(return_value='fake-token'))), \
-                    patch('harness_app.cli.httpx.Client', return_value=client), \
-                    patch('sys.stdin.isatty', return_value=False), \
-                    patch('sys.stdout', new_callable=io.StringIO), \
-                    patch('sys.stderr', new_callable=io.StringIO), \
-                    patch('builtins.input', side_effect=AssertionError('must not prompt')):
-                cli.main(['Run the test'], directory=Path(directory) / '.harness')
-            self.assertEqual(len(requests), 2)
-            self.assertFalse(json.loads(requests[1]['input'][-1]['output'])['ok'])
-            self.assertFalse(marker.exists())
+            state = Path(directory) / '.harness'
+            with patch('harness_app.cli.AuthSession', side_effect=AssertionError('must not log in')) as auth, \
+                    patch('sys.stdin.isatty', return_value=terminal), \
+                    patch('sys.stderr', new_callable=io.StringIO):
+                with self.assertRaises(SystemExit) as caught:
+                    cli.main(arguments, directory=state)
+            self.assertEqual(caught.exception.code, 2)
+            auth.assert_not_called()
+            self.assertFalse(state.exists())

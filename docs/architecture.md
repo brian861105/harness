@@ -1,73 +1,71 @@
-# Architecture and navigation
+# Architecture
 
-The application separates startup, the agent loop, model transport, tools,
-authentication, persistence, and presentation. For routine changes, start with
-the [feature-to-file map](../README.md#find-the-code).
+This is a synchronous, single-process harness. The
+[README](../README.md#find-the-code) maps features to source and tests and covers
+startup, controls, tool limits, and local data.
+
+## Execution flow
 
 ```text
-harness.py                  Original launcher
-pyproject.toml              uv, package, and command configuration
-src/harness_app/
-  cli.py                    Arguments, wiring, process lock, exit diagnostics
-  agent.py                  Model/tool loop and complete turn transcripts
-  provider.py               Model selection and HTTP/SSE
-  config.py                 Endpoints and this checkout's .harness location
-  errors.py                 Shared sanitized errors
-  auth/
-    login.py                Browser login, callback, identity verification
-    session.py              Credential cache and token renewal
-  tools/
-    registry.py             Model-facing schemas and handler registration
-    files.py                Path policy, read/search, exact-text edits
-    shell.py                Bash and child-process lifecycle
-    limits.py               File, output, and execution limits
-  permissions.py            Diff/command previews and explicit approval
-  store.py                  SQLite sessions and conversation replay
-  ui.py                     Terminal display, input, interactive flow
-tests/                      Behavior tests grouped by responsibility
-docs/                       Architecture, contracts, implementation records
-.harness/                   Local state, excluded from Git
+CLI -> UI -> Runtime -> Agent -> Provider
+                |         |
+                v         v
+              Store     Tools -> approval/activity callbacks -> UI
 ```
 
-## One turn through the application
+1. `cli.main()` rejects nonterminal stdin and positional prompts before creating
+   state. It holds the process lock and wires the HTTP client, OAuth session,
+   model catalog, SQLite store, runtime, and UI.
+2. `ui.run_chat(runtime)` handles terminal input, rendering, slash commands, and
+   confirmations. `/model` and `/new` delegate state changes to the runtime.
+3. `ChatRuntime.run_turn()` creates tools, loads committed context, and invokes
+   `agent.ask()` with an output stream and approval/activity callbacks.
+4. The agent calls the provider, executes complete tool calls sequentially, and
+   continues with every model output item and matching tool result. The provider
+   handles HTTP/SSE and resolves a current access token before each request.
+5. The runtime saves the completed turn atomically and updates usage. Failure or
+   cancellation during generation leaves committed context unchanged. Display
+   interruption after completion must report the turn as saved. Approved local
+   effects remain after failure and the UI warns about them.
 
-1. `cli.main()` creates the HTTP client, authenticated session, model catalog,
-   and SQLite store before starting the UI. Single-prompt mode calls the agent
-   directly without conversation persistence.
-2. `ui.run_chat()` receives input, loads committed history from `store`, and
-   calls `agent.ask()`.
-3. `agent.ask()` calls `provider.request_response()`. The provider handles one
-   HTTP/SSE request; the agent decides whether another request is needed.
-4. After a complete model response requests tools, the agent calls
-   `tools.registry.ProjectTools.execute()`. File or Bash handlers execute the
-   operation, and the agent sends their results back with the original calls.
-5. Edits and commands invoke the injected approval callback. The UI pauses its
-   live display and uses `permissions.confirm_tool()` to present the proposal.
-   Tool implementations do not read terminal input directly.
-6. After the full turn completes, the UI saves the prompt, all model output,
-   and tool results to SQLite.
+All launchers use this flow. Single-prompt mode was removed because it bypassed
+conversation persistence without serving the interactive coding workflow.
+Runtime, agent, provider, auth, and tools never import UI or CLI. The runtime can
+also be called directly with a stream and callbacks; missing approval declines
+edits and commands. There is no separate headless CLI mode.
 
-Agent, provider, auth, and tool modules do not import `cli` or `ui`. This removes
-the earlier circular dependency between the terminal UI and the launcher.
-`permissions.py` presents approval prompts; path restrictions belong to
-`tools/files.py`, and process limits belong to `tools/shell.py`.
+## State and trust boundaries
 
-## Common changes
+- `store.py` owns SQLite. Sessions are isolated by verified client ID, subject,
+  and resolved workspace; startup resumes the latest matching session. Validate
+  requested models before changing state; fall back if a saved model disappears.
+  Preserve full output items, including opaque reasoning and tool results, for
+  replay without reexecution. Missing usage stays unknown.
+- `auth/login.py` binds a loopback callback with a five-minute timeout and fresh
+  state, nonce, and PKCE. Validate callback parameters, issued client ID, signed
+  ID-token issuer/audience/expiry/nonce/subject, and required inference scope.
+- `auth/session.py` binds cached credentials to registration and host identity,
+  rejects unsafe/malformed files, and atomically saves refresh rotation. Only
+  terminal refresh failures trigger login; transient failures retain credentials.
+  Never print secrets or automatically replay inference after a failure.
+- File path restrictions belong to `tools/files.py`; execution/output limits and
+  process cleanup belong to `tools/shell.py` and `tools/limits.py`. Bash uses OS
+  permissions, not a filesystem sandbox. `permissions.py` only presents approval.
+- State stays in the source checkout's `.harness/`; no schema migration is needed.
+  A global data directory for standalone wheel installs is not implemented.
 
-- **Add a tool:** implement it in its owning module and add its schema and
-  handler in `tools/registry.py`. Return JSON-serializable results. Put tests
-  under `tests/tools/`.
-- **Change model requests or streaming:** edit `provider.py`. Change tool
-  continuation order in `agent.py`.
-- **Change the terminal or commands:** edit `ui.py`; approval presentation
-  belongs to `permissions.py`.
-- **Change persistence:** edit `store.py`, preserving account and working
-  directory isolation.
-- **Debug login:** browser sign-in belongs to `auth/login.py`; saved credentials
-  and renewal belong to `auth/session.py`.
+## Changes and tests
 
-The layout refactor preserves credentials and SQLite in `.harness/`, without
-migrating user data. Run the package in editable mode through uv from a source
-checkout. Global data-directory behavior for standalone wheel installation is
-not implemented. See the [tool contract](designs/project-tools.md) for execution,
-approval, and cancellation semantics.
+Add tools by defining a function schema in `tools/registry.py`, implementing a
+handler in its owning module, and registering it in `ProjectTools.execute()`.
+Return JSON-serializable results. The custom `apply_patch` accepts `path`,
+`old_text`, and `new_text`: null old text creates; null new text deletes only
+with a complete-file match; updates require one unique match. Approved edits
+recheck the previewed snapshot and preserve executable permissions.
+
+Keep session/turn policy in `runtime.py`, model/tool continuation in `agent.py`,
+transport in `provider.py`, and input/display in `ui.py`. Tests follow those
+boundaries: runtime tests cover state not already exercised by terminal flows;
+UI tests verify command/approval/recovery integration with real SQLite and fake
+HTTP. Provider, auth, and tool tests cover protocol and safety edge cases.
+Shared synthetic responses live in `tests/fakes.py`.

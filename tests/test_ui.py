@@ -12,10 +12,9 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from harness_app.store import ChatStore
-from harness_app.ui import display_text, run_chat
-
-CATALOG = {'models': [{'slug': 'model-a', 'visibility': 'list'},
-                       {'slug': 'model-b', 'visibility': 'list'}]}
+from harness_app.runtime import ChatRuntime
+from harness_app.ui import StreamingMarkdown, display_text, run_chat
+from tests.fakes import CATALOG, chat_client, output, tool_call
 
 
 class ScriptedPrompt:
@@ -29,45 +28,19 @@ class ScriptedPrompt:
         return action
 
 
-def output(text):
-    return [{'type': 'message', 'role': 'assistant', 'content': [
-        {'type': 'output_text', 'text': text, 'annotations': []}]}]
-
-
 class UITests(unittest.TestCase):
     def run_chat(self, store, actions, results, workspace='/project', prompt_session=None):
         requests = []
-        responses = iter(results)
         rendered = io.StringIO()
-
-        def provider(request):
-            requests.append(json.loads(request.content))
-            item = next(responses)
-            if isinstance(item, BaseException):
-                raise item
-            if isinstance(item, httpx.Response):
-                return item
-            if isinstance(item, int):
-                return httpx.Response(item, json={'error': {'code': 'temporarily_unavailable'}})
-            if isinstance(item, dict):
-                response, events = item, []
-            else:
-                response = {'status': 'completed', 'output': output(item),
-                            'usage': {'input_tokens': 10, 'output_tokens': 2, 'total_tokens': 12}}
-                events = [{'type': 'response.output_text.delta', 'delta': item}]
-            events.append({'type': 'response.completed', 'response': response})
-            return httpx.Response(200, headers={'content-type': 'text/event-stream'},
-                                  text=''.join('data: ' + json.dumps(e) + '\n\n' for e in events))
-
-        with httpx.Client(transport=httpx.MockTransport(provider)) as client:
-            run_chat(client, 'test-token', CATALOG, store, 'account-a', workspace,
+        with chat_client(results, requests) as client:
+            runtime = ChatRuntime(client, 'test-token', CATALOG, store, 'account-a', workspace)
+            run_chat(runtime,
                      prompt_session=prompt_session or ScriptedPrompt(*actions),
                      console=Console(file=rendered, width=80, color_system=None))
         return requests, rendered.getvalue()
 
     def tool_response(self, name, arguments):
-        return {'status': 'completed', 'output': [{'type': 'function_call',
-                'call_id': 'call_' + name, 'name': name, 'arguments': json.dumps(arguments)}]}
+        return {'status': 'completed', 'output': [tool_call(name, arguments)]}
 
     def test_model_can_edit_code_after_terminal_confirmation(self):
         with tempfile.TemporaryDirectory() as directory, ChatStore(':memory:') as store:
@@ -103,14 +76,14 @@ class UITests(unittest.TestCase):
             database = root / '.harness' / 'chat.sqlite3'
             database.parent.mkdir()
             with ChatStore(database) as store:
-                self.run_chat(store, ['Run script', 'y', '/exit'], [
+                turn_requests, _ = self.run_chat(store, ['Run script', 'y', '/exit'], [
                     self.tool_response('run_shell', {'command': 'bash ./test.sh'}), 'Done'], workspace=directory)
             with ChatStore(database) as store:
                 requests, _ = self.run_chat(store, ['What happened?', '/exit'], ['Tests ran'], workspace=directory)
             self.assertEqual(script.with_name('count').read_text(), 'once\n')
             replay = requests[0]['input']
-            self.assertEqual([item.get('type') for item in replay[1:3]], ['function_call', 'function_call_output'])
-            self.assertEqual(json.loads(replay[2]['output'])['exit_code'], 0)
+            self.assertEqual(replay, turn_requests[1]['input'] + output('Done') + [
+                {'role': 'user', 'content': 'What happened?'}])
 
     def test_failed_turn_warns_that_approved_edits_remain(self):
         with tempfile.TemporaryDirectory() as directory, ChatStore(':memory:') as store:
@@ -130,19 +103,10 @@ class UITests(unittest.TestCase):
             self.assertEqual(requests[1]['input'], [{'role': 'user', 'content': 'Retry'}])
             self.assertIn('輸出格式不正確', text)
 
-    def test_followup_request_contains_committed_conversation(self):
+    def test_completed_turn_displays_reported_usage(self):
         with ChatStore(':memory:') as store:
-            requests, text = self.run_chat(store, ['My name is Ada', 'My name?', '/exit'], ['Hello Ada', 'Ada'])
-            self.assertEqual(requests[1]['input'], [
-                {'role': 'user', 'content': 'My name is Ada'}] + output('Hello Ada') + [
-                {'role': 'user', 'content': 'My name?'}])
-            self.assertIn('12', text)
-
-    def test_restart_replays_the_previous_session(self):
-        with ChatStore(':memory:') as store:
-            self.run_chat(store, ['Hi', '/exit'], ['Hello'])
-            requests, _ = self.run_chat(store, ['Again', '/exit'], ['Welcome back'])
-            self.assertEqual(requests[0]['input'][0], {'role': 'user', 'content': 'Hi'})
+            _, text = self.run_chat(store, ['Question', '/exit'], ['Answer'])
+            self.assertIn('本次 token：輸入 10 / 輸出 2 / 合計 12', text)
 
     def test_new_command_excludes_previous_context(self):
         with ChatStore(':memory:') as store:
@@ -160,12 +124,6 @@ class UITests(unittest.TestCase):
             requests, _ = self.run_chat(store, ['/model model-b', 'Hi', '/exit'], ['Hello'])
             self.assertEqual(requests[0]['model'], 'model-b')
 
-    def test_cancelled_request_is_not_replayed_on_retry(self):
-        with ChatStore(':memory:') as store:
-            requests, _ = self.run_chat(store, ['Cancelled', 'Retry', '/exit'], [KeyboardInterrupt(), 'Done'])
-            self.assertEqual(requests[1]['input'], [{'role': 'user', 'content': 'Retry'}])
-            self.assertEqual(store.prompts('account-a', '/project'), ['Retry'])
-
     def test_interrupt_after_partial_output_closes_stream_without_saving_it(self):
         class InterruptedStream(httpx.SyncByteStream):
             closed = False
@@ -180,14 +138,19 @@ class UITests(unittest.TestCase):
         stream = InterruptedStream()
         response = httpx.Response(200, headers={'content-type': 'text/event-stream'}, stream=stream)
         with ChatStore(':memory:') as store:
-            requests, _ = self.run_chat(store, ['Cancelled', 'Retry', '/exit'], [response, 'Done'])
-            self.assertEqual(requests[1]['input'], [{'role': 'user', 'content': 'Retry'}])
+            requests, _ = self.run_chat(store, ['Saved', 'Cancelled', 'Retry', '/exit'], [
+                'Previous answer', response, 'Done'])
+            self.assertEqual(requests[2]['input'], [{'role': 'user', 'content': 'Saved'}]
+                             + output('Previous answer') + [{'role': 'user', 'content': 'Retry'}])
             self.assertTrue(stream.closed)
+            self.assertEqual(store.prompts('account-a', '/project'), ['Saved', 'Retry'])
 
     def test_network_failure_returns_to_input_without_committing_a_turn(self):
         with ChatStore(':memory:') as store:
-            requests, _ = self.run_chat(store, ['Failed', 'Retry', '/exit'], [httpx.ConnectError('offline'), 'Done'])
-            self.assertEqual(requests[1]['input'], [{'role': 'user', 'content': 'Retry'}])
+            requests, _ = self.run_chat(store, ['Saved', 'Failed', 'Retry', '/exit'], [
+                'Previous answer', httpx.ConnectError('offline'), 'Done'])
+            self.assertEqual(requests[2]['input'], [{'role': 'user', 'content': 'Saved'}]
+                             + output('Previous answer') + [{'role': 'user', 'content': 'Retry'}])
 
     def test_help_and_model_list_do_not_call_the_provider(self):
         with ChatStore(':memory:') as store:
@@ -201,6 +164,20 @@ class UITests(unittest.TestCase):
             requests, _ = self.run_chat(store, [KeyboardInterrupt(), EOFError()], [])
             self.assertEqual(requests, [])
 
+    def test_interrupt_after_commit_reports_the_turn_as_saved(self):
+        stop = StreamingMarkdown.__exit__
+
+        def interrupt_after_stop(writer, *args):
+            stop(writer, *args)
+            raise KeyboardInterrupt()
+
+        with ChatStore(':memory:') as store, \
+                patch.object(StreamingMarkdown, '__exit__', interrupt_after_stop):
+            _, text = self.run_chat(store, ['Question', '/exit'], ['Answer'])
+            self.assertEqual(store.prompts('account-a', '/project'), ['Question'])
+            self.assertIn('本輪已完成並儲存', text)
+            self.assertNotIn('未儲存', text)
+
     def test_terminal_controls_are_removed_from_display(self):
         self.assertEqual(display_text('\x1b[31mHello\x1b[0m\r\x07'), 'Hello')
 
@@ -210,7 +187,8 @@ class UITests(unittest.TestCase):
             pipe.send_text('/help\r/exit\r')
             with httpx.Client(transport=httpx.MockTransport(
                     lambda request: self.fail('Commands must not call the model'))) as client:
-                run_chat(client, 'test-token', CATALOG, store, 'account', '/project',
+                runtime = ChatRuntime(client, 'test-token', CATALOG, store, 'account', '/project')
+                run_chat(runtime,
                          prompt_session=PromptSession(input=pipe, output=DummyOutput()),
                          console=Console(file=rendered, width=80, color_system=None))
         self.assertIn('/new', rendered.getvalue())
@@ -218,21 +196,14 @@ class UITests(unittest.TestCase):
     def test_default_prompt_supports_alt_enter_multiline(self):
         requests = []
         rendered = io.StringIO()
-
-        def provider(request):
-            requests.append(json.loads(request.content))
-            event = {'type': 'response.completed', 'response': {
-                'status': 'completed', 'output': output('Done')}}
-            return httpx.Response(200, headers={'content-type': 'text/event-stream'},
-                                  text='data: ' + json.dumps(event) + '\n\n')
-
         with ChatStore(':memory:') as store, create_pipe_input() as pipe:
             pipe.send_text('first\x1b\rsecond\r/exit\r')
             def session_factory(**kwargs):
                 return PromptSession(input=pipe, output=DummyOutput(), **kwargs)
             with patch('harness_app.ui.PromptSession', side_effect=session_factory), \
-                    httpx.Client(transport=httpx.MockTransport(provider)) as client:
-                run_chat(client, 'test-token', CATALOG, store, 'account', '/project',
+                    chat_client(['Done'], requests) as client:
+                runtime = ChatRuntime(client, 'test-token', CATALOG, store, 'account', '/project')
+                run_chat(runtime,
                          console=Console(file=rendered, width=80, color_system=None))
         self.assertEqual(requests[0]['input'], [{'role': 'user', 'content': 'first\nsecond'}])
 

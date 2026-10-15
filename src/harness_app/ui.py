@@ -1,4 +1,4 @@
-"""Interactive terminal chat backed by SQLite."""
+"""Terminal input, streaming display, and approval presentation."""
 
 import re
 
@@ -14,11 +14,8 @@ from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
 
-from .agent import ask
 from .errors import HarnessError
 from .permissions import confirm_tool
-from .provider import choose_model
-from .tools.registry import ProjectTools
 
 COMMANDS = ['/help', '/model', '/new', '/exit']
 
@@ -79,22 +76,14 @@ def show_turn(console, turn):
     console.print()
 
 
-def run_chat(client, access_token, catalog, store, owner, workspace,
-             requested_model=None, prompt_session=None, console=None):
+def run_chat(runtime, prompt_session=None, console=None):
     console = console or Console()
-    default_model = choose_model(catalog, requested_model)
-    session = store.session(owner, workspace, default_model)
-    try:
-        model = choose_model(catalog, requested_model or session['model'])
-    except HarnessError:
-        model = default_model
-        console.print('原本的模型目前不可用，已改用：' + display_text(model))
-    store.set_model(session['id'], model)
-    turns = store.turns(session['id'])
-    last_usage = turns[-1]['usage'] if turns else None
-    console.print(Panel(Text('model: ' + display_text(model) + '\n'
-                            'directory: ' + display_text(workspace) + '\n'
-                            'ChatGPT plan · session ' + session['id'][:8]),
+    if runtime.model_fallback:
+        console.print('原本的模型目前不可用，已改用：' + display_text(runtime.model))
+    turns = runtime.turns()
+    console.print(Panel(Text('model: ' + display_text(runtime.model) + '\n'
+                            'directory: ' + display_text(runtime.workspace) + '\n'
+                            'ChatGPT plan · session ' + runtime.session_id[:8]),
                         title='Python Harness', border_style='cyan'))
     if turns:
         console.print('已接續 {} 輪對話，顯示最近三輪。'.format(len(turns)), style='dim')
@@ -111,7 +100,7 @@ def run_chat(client, access_token, catalog, store, owner, workspace,
             event.current_buffer.insert_text('\n')
 
         prompt_session = PromptSession(
-            history=InMemoryHistory(history_strings=store.prompts(owner, workspace)),
+            history=InMemoryHistory(history_strings=runtime.prompts()),
             completer=WordCompleter(COMMANDS, sentence=True),
             complete_while_typing=False, key_bindings=bindings,
         )
@@ -119,7 +108,7 @@ def run_chat(client, access_token, catalog, store, owner, workspace,
     while True:
         try:
             prompt = prompt_session.prompt('› ', bottom_toolbar=lambda: [('',
-                display_text(model) + ' · ' + session['id'][:8] + ' · ' + usage_text(last_usage))])
+                display_text(runtime.model) + ' · ' + runtime.session_id[:8] + ' · ' + usage_text(runtime.last_usage))])
         except KeyboardInterrupt:
             continue
         except EOFError:
@@ -136,48 +125,43 @@ def run_chat(client, access_token, catalog, store, owner, workspace,
                                    '/new  開新對話，保留舊紀錄\n/exit  離開'))
             elif command == '/model':
                 if not argument:
-                    for item in catalog['models']:
+                    for item in runtime.catalog['models']:
                         if item.get('visibility') == 'list':
-                            console.print(Text(('• ' if item['slug'] == model else '  ') + display_text(item['slug'])))
+                            console.print(Text(('• ' if item['slug'] == runtime.model else '  ') + display_text(item['slug'])))
                 else:
                     try:
-                        candidate = choose_model(catalog, argument)
+                        runtime.set_model(argument)
                     except HarnessError as error:
                         console.print(Text(display_text(str(error)), style='yellow'))
                         continue
-                    store.set_model(session['id'], candidate)
-                    model = candidate
-                    console.print(Text('模型已切換：' + display_text(model)))
+                    console.print(Text('模型已切換：' + display_text(runtime.model)))
             elif command == '/new':
-                session = store.session(owner, workspace, model, new=True)
-                last_usage = None
-                console.print(Text('已開啟新對話：' + session['id'][:8], style='cyan'))
+                runtime.new_session()
+                console.print(Text('已開啟新對話：' + runtime.session_id[:8], style='cyan'))
             else:
                 console.print('未知指令，請輸入 /help。', style='yellow')
             continue
 
-        tools = None
-        saved = False
+        turn_state = 'pending'
         try:
             with StreamingMarkdown(console) as writer:
-                tools = ProjectTools(workspace, notify=writer.notify,
-                                     approve=lambda name, preview: writer.approve(name, preview, prompt_session))
-                response = ask(client, access_token, prompt, model, writer,
-                               history=store.inputs(session['id']), tools=tools)
-            store.append_turn(session['id'], prompt, response, model)
-            saved = True
-        except KeyboardInterrupt:
-            console.print('\n已停止本次生成，本輪未儲存。', style='yellow')
-            continue
-        except httpx.HTTPError:
-            console.print('\n連線失敗或逾時，本輪未儲存；可重新輸入。', style='yellow')
-            continue
-        except HarnessError as error:
-            console.print(Text('\n' + display_text(str(error)) + ' 本輪未儲存。', style='yellow'))
+                turn_state = 'running'
+                runtime.run_turn(prompt, writer, notify=writer.notify,
+                                 approve=lambda name, preview: writer.approve(name, preview, prompt_session))
+                turn_state = 'saved'
+        except (KeyboardInterrupt, httpx.HTTPError, HarnessError) as error:
+            if turn_state == 'saved':
+                message = '本輪已完成並儲存；終端顯示已中斷。'
+            elif isinstance(error, KeyboardInterrupt):
+                message = '已停止本次生成，本輪未儲存。'
+            elif isinstance(error, httpx.HTTPError):
+                message = '連線失敗或逾時，本輪未儲存；可重新輸入。'
+            else:
+                message = display_text(str(error)) + ' 本輪未儲存。'
+            console.print(Text('\n' + message, style='yellow'))
             continue
         finally:
-            if tools is not None and tools.side_effects and not saved:
+            if turn_state == 'running' and runtime.side_effects:
                 console.print('已執行的工具操作不會自動復原；再次嘗試前請檢查檔案與命令結果。', style='yellow')
-        last_usage = response.get('usage')
-        console.print(Text(usage_text(last_usage), style='dim'))
+        console.print(Text(usage_text(runtime.last_usage), style='dim'))
         console.print()
