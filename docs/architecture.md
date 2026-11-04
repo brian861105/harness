@@ -18,7 +18,9 @@ CLI -> UI -> Runtime -> Agent -> Provider
    model catalog, SQLite store, runtime, and UI.
 2. `ui.run_chat(runtime)` handles terminal input, rendering, slash commands, and
    confirmations. `/model` and `/new` delegate state changes to the runtime.
-3. `ChatRuntime.run_turn()` creates tools, loads committed context, and invokes
+3. `ChatRuntime` loads instructions (base prompt, `AGENTS.md`, skill listing) and
+   skills once per session through `context.load_context()`, keeping the prefix
+   stable across turns. `ChatRuntime.run_turn()` creates tools, loads committed context, and invokes
    `agent.ask()` with an output stream and approval/activity callbacks.
 4. The agent calls the provider, executes complete tool calls sequentially, and
    continues with every model output item and matching tool result. The provider
@@ -51,6 +53,11 @@ edits and commands. There is no separate headless CLI mode.
 - File path restrictions belong to `tools/files.py`; execution/output limits and
   process cleanup belong to `tools/shell.py` and `tools/limits.py`. Bash uses OS
   permissions, not a filesystem sandbox. `permissions.py` only presents approval.
+- `skills.py` owns skill discovery, frontmatter validation, and reads confined to
+  the resolved skill directory. Project skills precede `~/.agents/skills`; the
+  user root is passed in by the CLI so tests never read real home state.
+  `/skill:NAME` stores the expanded prompt for replay; `typed_prompt()` recovers
+  the typed text for history and display.
 - State stays in the source checkout's `.harness/`; no schema migration is needed.
   A global data directory for standalone wheel installs is not implemented.
 

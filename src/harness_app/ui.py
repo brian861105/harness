@@ -67,13 +67,23 @@ class StreamingMarkdown:
 
 
 def show_turn(console, turn):
-    console.print(Text('› ' + display_text(turn['prompt']), style='bold cyan'))
+    console.print(Text('› ' + display_text(turn['display']), style='bold cyan'))
     for item in turn['output']:
         if item.get('type') == 'message':
             text = '\n'.join(part.get('text', part.get('refusal', ''))
                              for part in item.get('content', []))
             console.print(Markdown(display_text(text)))
     console.print()
+
+
+def context_text(context):
+    skills = len(context['skills'])
+    return ('AGENTS.md' if context['agents'] else 'no AGENTS.md') + ' · ' + str(skills) + ' skill' + ('' if skills == 1 else 's')
+
+
+def show_context_warnings(console, context):
+    for warning in context['warnings']:
+        console.print(Text(display_text(warning), style='yellow'))
 
 
 def run_chat(runtime, prompt_session=None, console=None):
@@ -83,8 +93,10 @@ def run_chat(runtime, prompt_session=None, console=None):
     turns = runtime.turns()
     console.print(Panel(Text('model: ' + display_text(runtime.model) + '\n'
                             'directory: ' + display_text(runtime.workspace) + '\n'
+                            'context: ' + display_text(context_text(runtime.context)) + '\n'
                             'ChatGPT plan · session ' + runtime.session_id[:8]),
                         title='Python Harness', border_style='cyan'))
+    show_context_warnings(console, runtime.context)
     if turns:
         console.print('已接續 {} 輪對話，顯示最近三輪。'.format(len(turns)), style='dim')
         for turn in turns[-3:]:
@@ -101,7 +113,8 @@ def run_chat(runtime, prompt_session=None, console=None):
 
         prompt_session = PromptSession(
             history=InMemoryHistory(history_strings=runtime.prompts()),
-            completer=WordCompleter(COMMANDS, sentence=True),
+            completer=WordCompleter(lambda: COMMANDS + ['/skill:' + name for name in runtime.context['skills']],
+                                    sentence=True),
             complete_while_typing=False, key_bindings=bindings,
         )
 
@@ -115,14 +128,25 @@ def run_chat(runtime, prompt_session=None, console=None):
             break
         if not prompt.strip():
             continue
-        if prompt.startswith('/'):
+        if prompt.startswith('/skill:'):
+            name, request = re.match(r'/skill:(\S*)\s*(.*)', prompt.strip(), re.S).groups()
+            try:
+                prompt = runtime.skill_prompt(name, request)
+            except HarnessError as error:
+                console.print(Text(display_text(str(error)), style='yellow'))
+                continue
+        elif prompt.startswith('/'):
             command, _, argument = prompt.strip().partition(' ')
             argument = argument.strip()
             if command == '/exit':
                 break
             if command == '/help':
                 console.print(Text('/help  指令說明\n/model [slug]  列出或切換模型\n'
-                                   '/new  開新對話，保留舊紀錄\n/exit  離開'))
+                                   '/new  開新對話，保留舊紀錄並重新載入 AGENTS.md 與 skills\n'
+                                   '/skill:名稱 [需求]  套用指定 skill\n/exit  離開'))
+                for skill in runtime.context['skills'].values():
+                    console.print(Text('  /skill:' + skill['name'] + '  ' + display_text(skill['description']),
+                                       style='dim'))
             elif command == '/model':
                 if not argument:
                     for item in runtime.catalog['models']:
@@ -137,7 +161,9 @@ def run_chat(runtime, prompt_session=None, console=None):
                     console.print(Text('模型已切換：' + display_text(runtime.model)))
             elif command == '/new':
                 runtime.new_session()
-                console.print(Text('已開啟新對話：' + runtime.session_id[:8], style='cyan'))
+                console.print(Text('已開啟新對話：' + runtime.session_id[:8] + ' · '
+                                   + display_text(context_text(runtime.context)), style='cyan'))
+                show_context_warnings(console, runtime.context)
             else:
                 console.print('未知指令，請輸入 /help。', style='yellow')
             continue

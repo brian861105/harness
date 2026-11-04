@@ -48,7 +48,8 @@ is allowed.
 | Ctrl+D or `/exit` | Exit |
 | `/help` | Show commands |
 | `/model [SLUG]` | List available models or switch the active model |
-| `/new` | Start an empty conversation, keeping previous data |
+| `/new` | Start an empty conversation, keeping previous data, and reload AGENTS.md and skills |
+| `/skill:NAME [REQUEST]` | Send a request with the named skill's `SKILL.md` attached |
 
 Only complete turns are saved. Failed, incomplete, or cancelled generation
 is excluded from later context. Interrupting display cleanup after a turn has
@@ -56,6 +57,45 @@ been saved keeps that turn and reports it as saved. Usage shows the turn's
 input/output/total tokens, not remaining Pro allowance; missing usage stays
 unknown. Context is replayed in full without compaction; use `/new` when needed.
 Session browsing and deletion are not implemented.
+
+## Project instructions and skills
+
+At startup and on `/new`, the harness loads model instructions for the session:
+
+- `AGENTS.md` in the working directory is appended to the built-in instructions.
+  It must be UTF-8, at most 32 KiB, and resolve inside the project (a symlink
+  such as `AGENTS.md -> CLAUDE.md` is allowed). Edits apply after `/new`.
+- Skills use the [Agent Skills](https://agentskills.io) layout shared by tools
+  such as pi and Claude Code: a directory containing `SKILL.md` with YAML
+  frontmatter, plus optional `scripts/`, `references/`, or `assets/`.
+
+```text
+.agents/skills/review/SKILL.md     # project skill, versioned with the project
+~/.agents/skills/review/SKILL.md   # user skill, available in every project
+```
+
+```markdown
+---
+name: review
+description: Review a diff for bugs and missing tests. Use before committing.
+---
+Read the staged diff, then ...
+```
+
+`name` uses lowercase letters, digits, and single hyphens (64 characters max);
+`description` is required (1024 characters max). Invalid skills are skipped
+with a startup warning; on a name collision the project skill wins. Set
+`disable-model-invocation: true` to hide a skill from the model so that only
+`/skill:NAME` uses it. The startup panel shows what was loaded.
+
+Only each skill's name and description go into the instructions. When a task
+matches, the model calls `load_skill` to read `SKILL.md` and the skill's file
+list, and can read other files inside that skill directory. Skill scripts run
+through `run_shell` with the usual approval. `/skill:NAME` attaches `SKILL.md`
+directly; history shows only the typed command.
+
+AGENTS.md and skills are trusted instructions. Review them before working in a
+project you did not write, just as you would review its scripts.
 
 ## Project tools
 
@@ -68,6 +108,7 @@ explain it, then run it". The model chooses tools and continues from results.
 | `grep` | Search with ripgrep; return paths, line numbers, and matches |
 | `apply_patch` | Preview and approve an exact-text file create, update, or delete |
 | `run_shell` | Preview and approve Bash commands, including `.sh` scripts |
+| `load_skill` | Read a loaded skill's files; offered only when skills exist |
 
 Edits and commands require `y` or `yes` for each call. Other input or EOF
 declines; Ctrl+C stops the turn. Approved effects are not rolled back if a
@@ -122,6 +163,7 @@ execution flow, boundaries, and extension rules.
 | Startup and application wiring | [cli.py](src/harness_app/cli.py) | [test_cli.py](tests/test_cli.py) |
 | Session, model, turn execution and saving | [runtime.py](src/harness_app/runtime.py) | [test_runtime.py](tests/test_runtime.py) |
 | Model/tool loop | [agent.py](src/harness_app/agent.py) | [test_agent.py](tests/test_agent.py) |
+| Instructions, AGENTS.md, and skills | [context.py](src/harness_app/context.py), [skills.py](src/harness_app/skills.py) | [test_skills.py](tests/test_skills.py) |
 | Model selection and HTTP/SSE | [provider.py](src/harness_app/provider.py) | [test_provider.py](tests/test_provider.py) |
 | Browser OAuth | [auth/login.py](src/harness_app/auth/login.py) | [test_login.py](tests/auth/test_login.py) |
 | Credential cache and renewal | [auth/session.py](src/harness_app/auth/session.py) | [test_session.py](tests/auth/test_session.py) |

@@ -6,13 +6,15 @@ from .errors import HarnessError
 from .provider import request_response
 
 
-def ask(client, access_token, prompt, model, output, history=None, tools=None):
+def ask(client, access_token, prompt, model, output, history=None, tools=None,
+        instructions=None):
     items = list(history or []) + [{'role': 'user', 'content': prompt}]
     if tools is None:
         return request_response(client, access_token, items, model, output)
     transcript, usages, seen_calls = [], [], set()
     for step in range(10):
-        response = request_response(client, access_token, items, model, output, tools)
+        response = request_response(client, access_token, items, model, output, tools,
+                                    instructions)
         if response.get('status') != 'completed' or not isinstance(response.get('output'), list):
             raise HarnessError('模型沒有提供完整的工具回應。')
         batch = response['output']

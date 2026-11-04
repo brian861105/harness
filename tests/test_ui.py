@@ -178,6 +178,41 @@ class UITests(unittest.TestCase):
             self.assertIn('本輪已完成並儲存', text)
             self.assertNotIn('未儲存', text)
 
+    def skill_project(self, directory):
+        root = Path(directory)
+        (root / 'AGENTS.md').write_text('Run uv tests.\n')
+        skill = root / '.agents' / 'skills' / 'review'
+        (skill / 'references').mkdir(parents=True)
+        (skill / 'SKILL.md').write_text('---\nname: review\ndescription: Review diffs.\n---\nCheck tests.\n')
+        (skill / 'references' / 'rules.md').write_text('No TODOs.\n')
+
+    def test_project_context_and_skill_tool_reach_the_model(self):
+        with tempfile.TemporaryDirectory() as directory, ChatStore(':memory:') as store:
+            self.skill_project(directory)
+            requests, text = self.run_chat(store, ['Review', '/exit'], [
+                self.tool_response('load_skill', {'name': 'review', 'path': 'references/rules.md'}),
+                'Reviewed'], workspace=directory)
+            self.assertIn('Run uv tests.', requests[0]['instructions'])
+            self.assertIn('- review: Review diffs.', requests[0]['instructions'])
+            self.assertIn('load_skill', [tool['name'] for tool in requests[0]['tools']])
+            self.assertEqual(json.loads(requests[1]['input'][-1]['output'])['content'], 'No TODOs.\n')
+            self.assertIn('AGENTS.md · 1 skill', text)
+
+    def test_skill_command_sends_skill_but_displays_typed_request(self):
+        with tempfile.TemporaryDirectory() as directory, ChatStore(':memory:') as store:
+            self.skill_project(directory)
+            requests, text = self.run_chat(store, ['/skill:missing', '/skill:review the diff', '/exit'],
+                                           ['Done'], workspace=directory)
+            self.assertEqual(len(requests), 1)
+            self.assertIn('找不到 skill：missing', text)
+            sent = requests[0]['input'][0]['content']
+            self.assertTrue(sent.startswith('/skill:review the diff\n\n<skill name="review"'))
+            self.assertIn('Check tests.', sent)
+            self.assertEqual(store.prompts('account-a', directory), [sent])
+            _, resumed = self.run_chat(store, ['/exit'], [], workspace=directory)
+            self.assertIn('› /skill:review the diff', resumed)
+            self.assertNotIn('Check tests.', resumed)
+
     def test_terminal_controls_are_removed_from_display(self):
         self.assertEqual(display_text('\x1b[31mHello\x1b[0m\r\x07'), 'Hello')
 

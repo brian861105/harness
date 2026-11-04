@@ -43,7 +43,8 @@ def main(argv=None, directory=None):
             owner = json.dumps([profile['client_id'], profile['subject']])
             with ChatStore(directory / 'chat.sqlite3') as store:
                 runtime = ChatRuntime(client, auth.access_token, catalog, store, owner,
-                                      str(Path.cwd().resolve()), requested_model=args.model)
+                                      str(Path.cwd().resolve()), requested_model=args.model,
+                                      user_skills=Path.home() / '.agents' / 'skills')
                 run_chat(runtime)
 
 
