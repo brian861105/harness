@@ -1,12 +1,13 @@
 """Agent Skills discovery, frontmatter validation, and bounded skill file reads."""
 
+import os
 import re
 from pathlib import Path
 
 import yaml
 
 from .errors import HarnessError
-from .tools.limits import FILE_LIMIT, OUTPUT_LIMIT
+from .tools.limits import FILE_LIMIT, OUTPUT_LIMIT, PRIVATE_PARTS
 
 NAME = re.compile(r'[a-z0-9]+(?:-[a-z0-9]+)*')
 SKILL_FILE_LIST_LIMIT = 100
@@ -14,8 +15,8 @@ SKILL_FILE_LIST_LIMIT = 100
 
 def parse_skill(manifest):
     content = Path(manifest).read_bytes()
-    if len(content) > FILE_LIMIT:
-        raise HarnessError('SKILL.md 超過 1 MiB。')
+    if len(content) > OUTPUT_LIMIT:
+        raise HarnessError('SKILL.md 超過 32 KiB；請把細節移到 references/。')
     try:
         text = content.decode('utf-8')
     except UnicodeDecodeError:
@@ -48,7 +49,12 @@ def discover_skills(roots):
         root = Path(root)
         if not root.is_dir():
             continue
-        for manifest in sorted(root.glob('*/SKILL.md')):
+        try:
+            manifests = sorted(root.glob('*/SKILL.md'))
+        except OSError:
+            warnings.append('無法讀取 skill 目錄：' + str(root))
+            continue
+        for manifest in manifests:
             try:
                 skill = parse_skill(manifest)
             except (HarnessError, OSError) as error:
@@ -62,6 +68,23 @@ def discover_skills(roots):
     return skills, warnings
 
 
+def hidden(part):
+    return part.startswith('.') or part.casefold() in PRIVATE_PARTS
+
+
+def skill_files(directory):
+    files = []
+    for current, directories, names in os.walk(directory):
+        directories[:] = sorted(name for name in directories if not hidden(name))
+        base = Path(current).relative_to(directory)
+        for name in sorted(names):
+            if not hidden(name):
+                files.append((base / name).as_posix())
+                if len(files) == SKILL_FILE_LIST_LIMIT:
+                    return files
+    return files
+
+
 def read_skill_file(skill, path=None):
     if path is not None and (not isinstance(path, str) or not path or '\0' in path):
         raise HarnessError('path 必須是 skill 目錄內的相對路徑或 null。')
@@ -70,6 +93,8 @@ def read_skill_file(skill, path=None):
     target = (directory / relative).resolve()
     if relative.is_absolute() or not target.is_relative_to(directory):
         raise HarnessError('skill 檔案必須位於該 skill 目錄內。')
+    if any(hidden(part) for part in relative.parts + target.relative_to(directory).parts):
+        raise HarnessError('load_skill 不可讀取隱藏或私人檔案。')
     if not target.is_file():
         raise HarnessError('skill 目錄內沒有這個檔案。')
     content = target.read_bytes()
@@ -84,10 +109,7 @@ def read_skill_file(skill, path=None):
               'content': content[:OUTPUT_LIMIT].decode('utf-8', errors='ignore'),
               'truncated': len(content) > OUTPUT_LIMIT}
     if path is None:
-        files = sorted(item.relative_to(directory).as_posix() for item in directory.rglob('*')
-                       if item.is_file() and not any(part.startswith('.') for part in
-                                                     item.relative_to(directory).parts))
-        result['files'] = files[:SKILL_FILE_LIST_LIMIT]
+        result['files'] = skill_files(directory)
     return result
 
 
@@ -108,12 +130,18 @@ SKILL_BLOCK = '\n\n<skill name="'
 def skill_prompt(typed, skill):
     """Expand an explicit /skill:name request; the typed text stays first for display."""
     loaded = read_skill_file(skill)
+    if loaded['truncated']:
+        raise HarnessError('SKILL.md 超過 32 KiB，無法附加。')
     return (typed + SKILL_BLOCK + skill['name'] + '" directory="' + loaded['directory'] + '">\n'
             + loaded['content'] + '\n</skill>\n'
             'The user explicitly invoked this skill. Follow it for the request above.')
 
 
 def typed_prompt(prompt):
-    if prompt.startswith('/skill:'):
-        return prompt.split(SKILL_BLOCK, 1)[0]
+    match = re.match(r'/skill:(\S+)', prompt)
+    if match:
+        # The block is appended last, so the final marker for this skill is the boundary.
+        index = prompt.rfind(SKILL_BLOCK + match.group(1) + '" directory="')
+        if index >= 0:
+            return prompt[:index]
     return prompt

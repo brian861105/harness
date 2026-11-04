@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from harness_app.context import BASE_INSTRUCTIONS, load_context
 from harness_app.errors import HarnessError
@@ -27,7 +28,8 @@ class SkillTests(unittest.TestCase):
                     'disable-model-invocation: true')
         cases = {'bad-name': 'name: Bad_Name\ndescription: x', 'no-description': 'name: empty',
                  'long': 'name: long\ndescription: ' + 'x' * 1025, 'yaml': 'name: [unclosed',
-                 'flag': 'name: flag\ndescription: x\ndisable-model-invocation: yes please'}
+                 'flag': 'name: flag\ndescription: x\ndisable-model-invocation: yes please',
+                 'large': 'name: large\ndescription: x\nnotes: ' + 'x' * 33000}
         for directory, frontmatter in cases.items():
             write_skill(self.root, directory, frontmatter)
         (self.root / 'nofront').mkdir()
@@ -61,12 +63,40 @@ class SkillTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaises(HarnessError):
                 read_skill_file(skill, path)
 
+    def test_private_files_are_neither_listed_nor_readable(self):
+        write_skill(self.root, 'tool', 'name: tool\ndescription: x')
+        for path in ['.env', '.git/config', 'node_modules/pkg/index.js', 'NODE_MODULES/x.js']:
+            target = self.root / 'tool' / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text('secret\n')
+        os.symlink('.env', self.root / 'tool' / 'alias.txt')
+        skill = discover_skills([self.root])[0]['tool']
+        self.assertEqual(read_skill_file(skill)['files'], ['SKILL.md', 'alias.txt'])
+        for path in ['.env', '.git/config', 'node_modules/pkg/index.js', 'NODE_MODULES/x.js', 'alias.txt']:
+            with self.subTest(path=path), self.assertRaises(HarnessError):
+                read_skill_file(skill, path)
+
+    def test_unreadable_skill_root_is_a_warning(self):
+        with patch.object(Path, 'glob', side_effect=PermissionError()):
+            skills, warnings = discover_skills([self.root])
+        self.assertEqual(skills, {})
+        self.assertIn('無法讀取 skill 目錄', warnings[0])
+
+    def test_skill_that_grew_past_the_limit_is_not_attached_partially(self):
+        manifest = write_skill(self.root, 'tool', 'name: tool\ndescription: x')
+        skill = discover_skills([self.root])[0]['tool']
+        manifest.write_text(manifest.read_text() + 'x' * 33000)
+        with self.assertRaises(HarnessError):
+            skill_prompt('/skill:tool', skill)
+
     def test_explicit_invocation_keeps_typed_text_for_display(self):
         write_skill(self.root, 'tool', 'name: tool\ndescription: x', 'Step one.\n')
         skill = discover_skills([self.root])[0]['tool']
         prompt = skill_prompt('/skill:tool fix\nthe bug', skill)
         self.assertIn('Step one.', prompt)
         self.assertEqual(typed_prompt(prompt), '/skill:tool fix\nthe bug')
+        quoted = '/skill:tool explain\n\n<skill name="tool" directory="x">'
+        self.assertEqual(typed_prompt(skill_prompt(quoted, skill)), quoted)
         self.assertEqual(typed_prompt('plain\n\n<skill name="x">'), 'plain\n\n<skill name="x">')
 
 
@@ -87,6 +117,11 @@ class ContextTests(unittest.TestCase):
         self.assertIn('- auto: Auto skill.', context['instructions'])
         self.assertNotIn('hidden', context['instructions'])
         self.assertEqual(sorted(context['skills']), ['auto', 'hidden'])
+
+    def test_home_workspace_does_not_load_user_skills_twice(self):
+        write_skill(self.root / '.agents' / 'skills', 'a', 'name: auto\ndescription: Auto skill.')
+        context = load_context(self.root, self.root / '.agents' / 'skills')
+        self.assertEqual((list(context['skills']), context['warnings']), (['auto'], []))
 
     def test_missing_context_uses_only_the_base_instructions(self):
         context = load_context(self.root)

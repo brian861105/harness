@@ -44,7 +44,7 @@ def load_context(workspace, user_skills=None):
     if agents and agents.strip():
         sections.append('Project instructions from AGENTS.md:\n' + agents.strip())
     roots = [Path(workspace) / '.agents' / 'skills']
-    if user_skills is not None:
+    if user_skills is not None and Path(user_skills).resolve() != roots[0].resolve():
         roots.append(Path(user_skills))
     skills, skill_warnings = discover_skills(roots)
     warnings.extend(skill_warnings)

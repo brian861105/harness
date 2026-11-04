@@ -83,14 +83,16 @@ Read the staged diff, then ...
 ```
 
 `name` uses lowercase letters, digits, and single hyphens (64 characters max);
-`description` is required (1024 characters max). Invalid skills are skipped
+`description` is required (1024 characters max). `SKILL.md` is limited to
+32 KiB; move long details into `references/`. Invalid skills are skipped
 with a startup warning; on a name collision the project skill wins. Set
 `disable-model-invocation: true` to hide a skill from the model so that only
 `/skill:NAME` uses it. The startup panel shows what was loaded.
 
 Only each skill's name and description go into the instructions. When a task
 matches, the model calls `load_skill` to read `SKILL.md` and the skill's file
-list, and can read other files inside that skill directory. Skill scripts run
+list, and can read other files inside that skill directory except hidden,
+`.env*`, `.git`, `.harness`, `.venv`, and `node_modules` paths. Skill scripts run
 through `run_shell` with the usual approval. `/skill:NAME` attaches `SKILL.md`
 directly; history shows only the typed command.
 
